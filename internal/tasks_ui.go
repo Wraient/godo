@@ -2,22 +2,26 @@ package internal
 
 import (
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/lipgloss"
+	"golang.org/x/term"
 )
 
 // Task represents a task or subtask
 type Task struct {
-	ID        string
-	Title     string
-	Notes     string
-	Completed bool
-	DueDate   time.Time
-	ParentID  string
-	Tasks     []Task // Subtasks within this task
+	ID          string
+	Title       string
+	Description string
+	Notes       string
+	Completed   bool
+	CreatedAt   time.Time
+	DueDate     time.Time
+	Tasks       []Task
 }
 
 // Model represents the state of our Bubble Tea program
@@ -25,35 +29,33 @@ type model struct {
 	tasks          []Task
 	completedTasks []Task
 	cursor         int
-	currentPath    []int // Tracks the current task hierarchy path
+	currentPath    []Task // Tracks the current task hierarchy path
 	input          textinput.Model
 	inputActive    bool
 	inputAction    string
 	deletedTaskID  string
+	editingField   string // Field currently being edited: "title", "description", "notes", "due_date"
+	width          int     // Terminal width
+	height         int     // Terminal height
 }
 
 // NewModel initializes the Bubble Tea model with tasks
 func NewModel(tasks []Task) model {
 	ti := textinput.New()
-	ti.Placeholder = "Enter task name..."
-	
-	// Split initial tasks into active and completed for the root level
-	var activeTasks, completedTasks []Task
-	for _, task := range tasks {
-		if task.Completed {
-			completedTasks = append(completedTasks, task)
-		} else {
-			activeTasks = append(activeTasks, task)
-		}
-	}
-	
+	ti.Placeholder = "Enter task title..."
+	ti.Focus()
+	ti.CharLimit = 156
+	ti.Width = 50
+
+	// Get terminal dimensions
+	width, height, _ := term.GetSize(int(os.Stdout.Fd()))
+
 	return model{
-		tasks: activeTasks,
-		completedTasks: completedTasks,
-		cursor: 0,
-		currentPath: []int{},
-		input: ti,
+		tasks:       tasks,
+		input:       ti,
 		inputActive: false,
+		width:       width,
+		height:      height,
 	}
 }
 
@@ -63,14 +65,10 @@ func (m *model) getCurrentTasks() ([]Task, []Task) {
 		return m.tasks, m.completedTasks
 	}
 
-	parentTask := &m.tasks[m.currentPath[0]]
-	for i := 1; i < len(m.currentPath); i++ {
-		parentTask = &parentTask.Tasks[m.currentPath[i]]
-	}
-
+	parentTask := &m.currentPath[len(m.currentPath)-1]
 	active := make([]Task, 0)
 	completed := make([]Task, 0)
-	
+
 	for _, task := range parentTask.Tasks {
 		if task.Completed {
 			completed = append(completed, task)
@@ -82,221 +80,246 @@ func (m *model) getCurrentTasks() ([]Task, []Task) {
 	return active, completed
 }
 
+func (m *model) updateTerminalSize() {
+	width, height, _ := term.GetSize(int(os.Stdout.Fd()))
+	m.width = width
+	m.height = height
+}
+
 // Init starts the program
 func (m model) Init() tea.Cmd {
+	m.input = textinput.New()
+	m.input.Focus()
+	m.updateTerminalSize()  // Get initial terminal size
 	return nil
 }
 
 // Update handles keypresses and updates the state of the UI
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, tea.ClearScreen // Clear screen when window size changes
+
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "down", "j":
-			if !m.inputActive {
+		// If input is active, handle all text input
+		if m.inputActive {
+			switch msg.String() {
+			case "esc":
+				m.inputActive = false
+				m.input.Blur()
+				return m, nil
+			case "enter":
+				// Save the input based on action type
 				active, completed := m.getCurrentTasks()
-				if m.cursor < len(active)-1 {
-					m.cursor++
-				} else if m.cursor == len(active)-1 && len(completed) > 0 {
-					m.cursor = len(active)
-				} else if m.cursor >= len(active) && m.cursor < len(active)+len(completed)-1 {
-					m.cursor++
-				}
-			} else {
-				var cmd tea.Cmd
-				m.input, cmd = m.input.Update(msg)
-				return m, cmd
-			}
-
-		case "up", "k":
-			if !m.inputActive {
-				active, _ := m.getCurrentTasks()
-				if m.cursor > len(active) {
-					m.cursor--
-				} else if m.cursor == len(active) {
-					m.cursor = len(active) - 1
-				} else if m.cursor > 0 {
-					m.cursor--
-				}
-			} else {
-				var cmd tea.Cmd
-				m.input, cmd = m.input.Update(msg)
-				return m, cmd
-			}
-
-		case "right", "l":
-			if !m.inputActive {
-				active, _ := m.getCurrentTasks()
-				if m.cursor < len(active) {
-					// Enter the selected task's sublist
-					m.currentPath = append(m.currentPath, m.cursor)
-					m.cursor = 0
-				}
-			}
-
-		case "left", "h":
-			if !m.inputActive && len(m.currentPath) > 0 {
-				// Go back to parent list
-				m.cursor = m.currentPath[len(m.currentPath)-1]
-				m.currentPath = m.currentPath[:len(m.currentPath)-1]
-			}
-
-		case "enter":
-			if !m.inputActive {
-				active, _ := m.getCurrentTasks()
-				if len(m.currentPath) == 0 {
-					if m.cursor < len(active) {
-						task := active[m.cursor]
-						task.Completed = true
-						m.completedTasks = append(m.completedTasks, task)
-						m.tasks = append(m.tasks[:m.cursor], m.tasks[m.cursor+1:]...)
-					} else {
-						completedIdx := m.cursor - len(active)
-						task := m.completedTasks[completedIdx]
-						task.Completed = false
-						m.tasks = append(m.tasks, task)
-						m.completedTasks = append(m.completedTasks[:completedIdx], m.completedTasks[completedIdx+1:]...)
-					}
-				} else {
-					parentTask := &m.tasks[m.currentPath[0]]
-					for i := 1; i < len(m.currentPath); i++ {
-						parentTask = &parentTask.Tasks[m.currentPath[i]]
-					}
-
-					var activeTasks []Task
-					var completedTasks []Task
-
-					for _, task := range parentTask.Tasks {
-						taskCopy := task
-						if task.Completed {
-							completedTasks = append(completedTasks, taskCopy)
-						} else {
-							activeTasks = append(activeTasks, taskCopy)
-						}
-					}
-
-					if m.cursor < len(active) {
-						task := activeTasks[m.cursor]
-						task.Completed = true
-						completedTasks = append(completedTasks, task)
-						activeTasks = append(activeTasks[:m.cursor], activeTasks[m.cursor+1:]...)
-					} else {
-						completedIdx := m.cursor - len(active)
-						task := completedTasks[completedIdx]
-						task.Completed = false
-						activeTasks = append(activeTasks, task)
-						completedTasks = append(completedTasks[:completedIdx], completedTasks[completedIdx+1:]...)
-					}
-
-					parentTask.Tasks = make([]Task, 0, len(activeTasks)+len(completedTasks))
-					parentTask.Tasks = append(parentTask.Tasks, activeTasks...)
-					parentTask.Tasks = append(parentTask.Tasks, completedTasks...)
-
-					if m.cursor >= len(activeTasks)+len(completedTasks) && m.cursor > 0 {
-						m.cursor--
-					}
-				}
-
-				if m.cursor >= len(active)-1 && m.cursor > 0 {
-					m.cursor--
-				}
-			} else {
-				taskTitle := m.input.Value()
 				switch m.inputAction {
-				case "new":
-					newTask := Task{
-						ID:        generateID(),
-						Title:     taskTitle,
-						Completed: false,
-						DueDate:   time.Now(),
-						Tasks:     []Task{},
-					}
-
+				case "description", "notes":
 					if len(m.currentPath) == 0 {
-						m.tasks = append(m.tasks, newTask)
-						m.cursor = len(m.tasks) - 1
-					} else {
-						parentTask := &m.tasks[m.currentPath[0]]
-						for i := 1; i < len(m.currentPath); i++ {
-							parentTask = &parentTask.Tasks[m.currentPath[i]]
-						}
-
-						var activeTasks []Task
-						var completedTasks []Task
-
-						for _, task := range parentTask.Tasks {
-							taskCopy := task
-							if task.Completed {
-								completedTasks = append(completedTasks, taskCopy)
+						if m.cursor < len(active) {
+							if m.inputAction == "description" {
+								active[m.cursor].Description = m.input.Value()
 							} else {
-								activeTasks = append(activeTasks, taskCopy)
+								active[m.cursor].Notes = m.input.Value()
+							}
+						} else {
+							completedIdx := m.cursor - len(active)
+							if m.inputAction == "description" {
+								completed[completedIdx].Description = m.input.Value()
+							} else {
+								completed[completedIdx].Notes = m.input.Value()
 							}
 						}
-
-						activeTasks = append(activeTasks, newTask)
-
-						parentTask.Tasks = make([]Task, 0, len(activeTasks)+len(completedTasks))
-						parentTask.Tasks = append(parentTask.Tasks, activeTasks...)
-						parentTask.Tasks = append(parentTask.Tasks, completedTasks...)
-
-						m.cursor = len(activeTasks) - 1
+					} else {
+						parentTask := &m.currentPath[len(m.currentPath)-1]
+						if m.cursor < len(parentTask.Tasks) {
+							if m.inputAction == "description" {
+								parentTask.Tasks[m.cursor].Description = m.input.Value()
+							} else {
+								parentTask.Tasks[m.cursor].Notes = m.input.Value()
+							}
+						}
 					}
 				case "rename":
-					active, _ := m.getCurrentTasks()
 					if len(m.currentPath) == 0 {
 						if m.cursor < len(active) {
-							active[m.cursor].Title = taskTitle
+							active[m.cursor].Title = m.input.Value()
 						} else {
 							completedIdx := m.cursor - len(active)
-							m.completedTasks[completedIdx].Title = taskTitle
+							completed[completedIdx].Title = m.input.Value()
 						}
 					} else {
-						parentTask := &m.tasks[m.currentPath[0]]
-						for i := 1; i < len(m.currentPath); i++ {
-							parentTask = &parentTask.Tasks[m.currentPath[i]]
+						parentTask := &m.currentPath[len(m.currentPath)-1]
+						if m.cursor < len(parentTask.Tasks) {
+							parentTask.Tasks[m.cursor].Title = m.input.Value()
 						}
-
-						var activeTasks []Task
-						var completedTasks []Task
-
-						for _, task := range parentTask.Tasks {
-							taskCopy := task
-							if task.Completed {
-								completedTasks = append(completedTasks, taskCopy)
+					}
+				case "due_date":
+					dateStr := m.input.Value()
+					if dateStr == "" {
+						m.inputActive = false
+						m.input.Blur()
+						return m, nil
+					}
+					dueDate, err := time.Parse("2006-01-02 15:04", dateStr)
+					if err == nil {
+						if len(m.currentPath) == 0 {
+							if m.cursor < len(active) {
+								active[m.cursor].DueDate = dueDate
 							} else {
-								activeTasks = append(activeTasks, taskCopy)
+								completedIdx := m.cursor - len(active)
+								completed[completedIdx].DueDate = dueDate
+							}
+						} else {
+							parentTask := &m.currentPath[len(m.currentPath)-1]
+							if m.cursor < len(parentTask.Tasks) {
+								parentTask.Tasks[m.cursor].DueDate = dueDate
 							}
 						}
-
-						if m.cursor < len(active) {
-							activeTasks[m.cursor].Title = taskTitle
-						} else {
-							completedIdx := m.cursor - len(active)
-							completedTasks[completedIdx].Title = taskTitle
+					}
+				case "new_task":
+					newTask := Task{
+						ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
+						Title:     m.input.Value(),
+						CreatedAt: time.Now(),
+					}
+					if len(m.currentPath) == 0 {
+						m.tasks = append(m.tasks, newTask)
+						m.cursor = len(active)
+					} else {
+						// Find the actual task in the main task list
+						currentTask := &m.tasks
+						var taskPtr *Task
+						for i, pathTask := range m.currentPath {
+							for j := range *currentTask {
+								if (*currentTask)[j].ID == pathTask.ID {
+									if i == len(m.currentPath)-1 {
+										taskPtr = &(*currentTask)[j]
+									} else {
+										currentTask = &(*currentTask)[j].Tasks
+									}
+									break
+								}
+							}
 						}
-
-						parentTask.Tasks = make([]Task, 0, len(activeTasks)+len(completedTasks))
-						parentTask.Tasks = append(parentTask.Tasks, activeTasks...)
-						parentTask.Tasks = append(parentTask.Tasks, completedTasks...)
+						if taskPtr != nil {
+							taskPtr.Tasks = append(taskPtr.Tasks, newTask)
+							m.cursor = len(taskPtr.Tasks) - 1
+							m.currentPath[len(m.currentPath)-1] = *taskPtr
+						}
 					}
 				}
 				m.inputActive = false
 				m.input.Blur()
+				return m, nil
+			default:
+				var cmd tea.Cmd
+				m.input, cmd = m.input.Update(msg)
+				return m, cmd
+			}
+		}
+
+		// Handle navigation and shortcuts when input is not active
+		switch msg.String() {
+		case "down", "j":
+			m.updateTerminalSize()  // Update size on cursor movement
+			active, completed := m.getCurrentTasks()
+			if m.cursor < len(active)+len(completed)-1 {
+				m.cursor++
+				return m, tea.ClearScreen
+			}
+
+		case "up", "k":
+			m.updateTerminalSize()  // Update size on cursor movement
+			if m.cursor > 0 {
+				m.cursor--
+				return m, tea.ClearScreen
+			}
+
+		case "right", "l":
+			active, _ := m.getCurrentTasks()
+			if m.cursor < len(active) {
+				task := &active[m.cursor]
+				m.currentPath = append(m.currentPath, *task)
+				m.cursor = 0
+			}
+
+		case "left", "h":
+			if len(m.currentPath) > 0 {
+				m.cursor = 0
+				m.currentPath = m.currentPath[:len(m.currentPath)-1]
+			}
+
+		case "enter":
+			active, completed := m.getCurrentTasks()
+			if len(m.currentPath) == 0 {
+				if m.cursor < len(active) {
+					// Mark task as completed
+					task := active[m.cursor]
+					task.Completed = true
+					m.completedTasks = append(m.completedTasks, task)
+					m.tasks = removeTask(m.tasks, task)
+				} else {
+					// Move task back to active
+					completedIdx := m.cursor - len(active)
+					task := completed[completedIdx]
+					task.Completed = false
+					m.tasks = append(m.tasks, task)
+					m.completedTasks = removeTask(m.completedTasks, task)
+				}
+			} else {
+				// Find and update the actual task in the main task list
+				currentTask := &m.tasks
+				var taskPtr *Task
+				for i, pathTask := range m.currentPath {
+					for j := range *currentTask {
+						if (*currentTask)[j].ID == pathTask.ID {
+							if i == len(m.currentPath)-1 {
+								taskPtr = &(*currentTask)[j]
+							} else {
+								currentTask = &(*currentTask)[j].Tasks
+							}
+							break
+						}
+					}
+				}
+				
+				if taskPtr != nil {
+					if m.cursor < len(active) {
+						// Mark subtask as completed
+						task := active[m.cursor]
+						task.Completed = true
+						taskPtr.Tasks = removeTask(taskPtr.Tasks, task)
+						taskPtr.Tasks = append(taskPtr.Tasks, task)
+					} else {
+						// Move subtask back to active
+						completedIdx := m.cursor - len(active)
+						task := completed[completedIdx]
+						task.Completed = false
+						taskPtr.Tasks = removeTask(taskPtr.Tasks, task)
+						taskPtr.Tasks = append(taskPtr.Tasks, task)
+					}
+					
+					// Update current path with latest task data
+					m.currentPath[len(m.currentPath)-1] = *taskPtr
+				}
 			}
 
 		case "n":
-			if !m.inputActive {
-				m.inputActive = true
-				m.inputAction = "new"
-				m.input.SetValue("")
-				m.input.Focus()
-			}
+			m.inputActive = true
+			m.inputAction = "new_task"
+			m.input.Placeholder = "Enter task title..."
+			m.input.SetValue("")
+			m.input.Focus()
+			return m, nil
 
 		case "r":
-			if !m.inputActive {
+			active, completed := m.getCurrentTasks()
+			if (m.cursor < len(active) && len(active) > 0) || 
+			   (m.cursor >= len(active) && m.cursor-len(active) < len(completed)) {
 				m.inputActive = true
 				m.inputAction = "rename"
-				active, completed := m.getCurrentTasks()
+				m.input.Placeholder = ""  // Clear any previous placeholder
 				if m.cursor < len(active) {
 					m.input.SetValue(active[m.cursor].Title)
 				} else {
@@ -306,157 +329,316 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.Focus()
 			}
 
-		case "d":
-			if !m.inputActive {
-				active, completed := m.getCurrentTasks()
-				if len(m.currentPath) == 0 {
-					if m.cursor < len(active) {
-						m.deletedTaskID = active[m.cursor].ID
-						m.tasks = append(m.tasks[:m.cursor], m.tasks[m.cursor+1:]...)
-					} else {
-						completedIdx := m.cursor - len(active)
-						m.deletedTaskID = completed[completedIdx].ID
-						m.completedTasks = append(m.completedTasks[:completedIdx], m.completedTasks[completedIdx+1:]...)
-					}
+		case "i":
+			active, completed := m.getCurrentTasks()
+			if (m.cursor < len(active) && len(active) > 0) || 
+			   (m.cursor >= len(active) && m.cursor-len(active) < len(completed)) {
+				m.inputActive = true
+				m.inputAction = "description"
+				m.input.Placeholder = ""  // Clear any previous placeholder
+				if m.cursor < len(active) {
+					m.input.SetValue(active[m.cursor].Description)
 				} else {
-					parentTask := &m.tasks[m.currentPath[0]]
-					for i := 1; i < len(m.currentPath); i++ {
-						parentTask = &parentTask.Tasks[m.currentPath[i]]
-					}
-
-					var activeTasks []Task
-					var completedTasks []Task
-
-					for _, task := range parentTask.Tasks {
-						taskCopy := task
-						if task.Completed {
-							completedTasks = append(completedTasks, taskCopy)
-						} else {
-							activeTasks = append(activeTasks, taskCopy)
-						}
-					}
-
-					if m.cursor < len(active) {
-						m.deletedTaskID = activeTasks[m.cursor].ID
-						activeTasks = append(activeTasks[:m.cursor], activeTasks[m.cursor+1:]...)
-					} else {
-						completedIdx := m.cursor - len(active)
-						m.deletedTaskID = completedTasks[completedIdx].ID
-						completedTasks = append(completedTasks[:completedIdx], completedTasks[completedIdx+1:]...)
-					}
-
-					parentTask.Tasks = make([]Task, 0, len(activeTasks)+len(completedTasks))
-					parentTask.Tasks = append(parentTask.Tasks, activeTasks...)
-					parentTask.Tasks = append(parentTask.Tasks, completedTasks...)
+					completedIdx := m.cursor - len(active)
+					m.input.SetValue(completed[completedIdx].Description)
 				}
+				m.input.Focus()
+				m.input.CursorEnd()
+			}
 
-				if m.cursor >= len(active)+len(completed)-1 && m.cursor > 0 {
-					m.cursor--
+		case "o":
+			active, completed := m.getCurrentTasks()
+			if (m.cursor < len(active) && len(active) > 0) || 
+			   (m.cursor >= len(active) && m.cursor-len(active) < len(completed)) {
+				m.inputActive = true
+				m.inputAction = "notes"
+				m.input.Placeholder = ""  // Clear any previous placeholder
+				if m.cursor < len(active) {
+					m.input.SetValue(active[m.cursor].Notes)
+				} else {
+					completedIdx := m.cursor - len(active)
+					m.input.SetValue(completed[completedIdx].Notes)
 				}
+				m.input.Focus()
+				m.input.CursorEnd()
 			}
 
-		case "esc":
-			if m.inputActive {
-				m.inputActive = false
-				m.input.Blur()
-			} else if len(m.currentPath) > 0 {
-				m.cursor = m.currentPath[len(m.currentPath)-1]
-				m.currentPath = m.currentPath[:len(m.currentPath)-1]
-			} else {
-				return m, tea.Quit
+		case "t":
+			active, completed := m.getCurrentTasks()
+			if (m.cursor < len(active) && len(active) > 0) || 
+			   (m.cursor >= len(active) && m.cursor-len(active) < len(completed)) {
+				m.inputActive = true
+				m.inputAction = "due_date"
+				m.input.Placeholder = "YYYY-MM-DD HH:MM"
+				
+				// Get the existing due date if any
+				var existingDate time.Time
+				if m.cursor < len(active) {
+					existingDate = active[m.cursor].DueDate
+				} else {
+					completedIdx := m.cursor - len(active)
+					existingDate = completed[completedIdx].DueDate
+				}
+				
+				if !existingDate.IsZero() {
+					m.input.SetValue(existingDate.Format("2006-01-02 15:04"))
+				} else {
+					m.input.SetValue("")
+				}
+				m.input.Focus()
 			}
 
-		default:
-			if m.inputActive {
-				var cmd tea.Cmd
-				m.input, cmd = m.input.Update(msg)
-				return m, cmd
-			}
+		case "q":
+			return m, tea.Quit
 		}
 	}
+
 	return m, nil
 }
 
 // View renders the UI
 func (m model) View() string {
-	var s string
+	var s strings.Builder
 
-	// Build breadcrumb trail
+	// Calculate panel widths based on terminal size
+	minMainWidth := 30  // Minimum width for main panel
+	minDetailsWidth := 30  // Minimum width for details panel
+	padding := 3  // Space between panels
+
+	// Adjust panel widths based on terminal size
+	mainPanelWidth := m.width * 2 / 3
+	detailsPanelWidth := m.width - mainPanelWidth - padding
+
+	// If terminal is too narrow, switch to full width for main panel
+	if m.width < minMainWidth+minDetailsWidth+padding {
+		mainPanelWidth = m.width
+		detailsPanelWidth = 0
+	} else if detailsPanelWidth < minDetailsWidth {
+		// Ensure details panel has minimum width if shown
+		detailsPanelWidth = minDetailsWidth
+		mainPanelWidth = m.width - minDetailsWidth - padding
+	}
+
+	// Build main task list panel
+	var mainPanel strings.Builder
 	if len(m.currentPath) > 0 {
-		breadcrumb := "Main"
-		current := m.tasks
-		for _, idx := range m.currentPath {
-			if idx < len(current) {
-				breadcrumb += " > " + current[idx].Title
-				current = current[idx].Tasks
+		// Show breadcrumb
+		path := "Main"
+		for _, task := range m.currentPath {
+			path += " > " + task.Title
+		}
+		mainPanel.WriteString(path + "\n\n")
+	}
+
+	if m.inputActive {
+		if m.inputAction == "due_date" {
+			input := m.input.Value()
+			format := "YYYY-MM-DD HH:MM"
+			
+			// Get the existing due date if any
+			var oldDate string
+			active, completed := m.getCurrentTasks()
+			if m.cursor < len(active) && !active[m.cursor].DueDate.IsZero() {
+				oldDate = active[m.cursor].DueDate.Format("2006-01-02 15:04")
+			} else if m.cursor >= len(active) && m.cursor-len(active) < len(completed) {
+				completedIdx := m.cursor - len(active)
+				if !completed[completedIdx].DueDate.IsZero() {
+					oldDate = completed[completedIdx].DueDate.Format("2006-01-02 15:04")
+				}
 			}
+			
+			if len(input) > 0 {
+				// Replace the format characters with actual input where available
+				if len(input) >= 4 {
+					format = input[:4] + format[4:]
+				}
+				if len(input) >= 7 {
+					format = input[:7] + format[7:]
+				}
+				if len(input) >= 10 {
+					format = input[:10] + format[10:]
+				}
+				if len(input) >= 13 {
+					format = input[:13] + format[13:]
+				}
+				if len(input) >= 16 {
+					format = input
+				}
+			}
+			
+			if oldDate != "" {
+				mainPanel.WriteString("Current due date: " + oldDate + "\n")
+			}
+			mainPanel.WriteString("Enter due date > " + format + "\n" + m.input.View() + "\n\n")
+		} else {
+			mainPanel.WriteString("Enter " + m.inputAction + ": " + m.input.View() + "\n\n")
 		}
-		s += lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("33")).Render(breadcrumb) + "\n\n"
 	} else {
-		s += lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("33")).Render("Task List") + "\n\n"
-	}
+		// Get current level's tasks
+		active, completed := m.getCurrentTasks()
 
-	// Get current level's tasks
-	active, completed := m.getCurrentTasks()
-
-	// Render active tasks
-	for i, task := range active {
-		cursor := " "
-		if m.cursor == i {
-			cursor = ">"
-		}
-
-		taskStyle := lipgloss.NewStyle().PaddingLeft(2)
-		if m.cursor == i {
-			taskStyle = taskStyle.Bold(true).Foreground(lipgloss.Color("36"))
-		}
-
-		hasSubtasks := len(task.Tasks) > 0
-		taskTitle := task.Title
-		if hasSubtasks {
-			taskTitle += " ▶"  // Add arrow to indicate subtasks
-		}
-
-		s += fmt.Sprintf("%s %s\n", cursor, taskStyle.Render(taskTitle))
-	}
-
-	// Render completed tasks
-	if len(completed) > 0 {
-		s += "\n" + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("31")).Render("Completed Tasks") + "\n\n"
-		for i, task := range completed {
+		// Show active tasks
+		mainPanel.WriteString("Tasks:\n\n")
+		for i, task := range active {
 			cursor := " "
-			if m.cursor == len(active)+i {
+			if m.cursor == i {
 				cursor = ">"
 			}
-
-			taskStyle := lipgloss.NewStyle().PaddingLeft(2).Foreground(lipgloss.Color("240"))
-			if m.cursor == len(active)+i {
-				taskStyle = taskStyle.Bold(true).Foreground(lipgloss.Color("36"))
-			}
-
-			hasSubtasks := len(task.Tasks) > 0
 			taskTitle := task.Title
-			if hasSubtasks {
+			if len(task.Tasks) > 0 {
 				taskTitle += " ▶"
 			}
+			if m.cursor == i {
+				taskTitle = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render(taskTitle)
+			}
+			mainPanel.WriteString(fmt.Sprintf("%s %s\n", cursor, taskTitle))
+		}
 
-			s += fmt.Sprintf("%s %s\n", cursor, taskStyle.Render(taskTitle))
+		// Show completed tasks if any
+		if len(completed) > 0 {
+			mainPanel.WriteString("\nCompleted Tasks:\n\n")
+			for i, task := range completed {
+				cursor := " "
+				if m.cursor == len(active)+i {
+					cursor = ">"
+				}
+				taskTitle := task.Title
+				if len(task.Tasks) > 0 {
+					taskTitle += " ▶"
+				}
+				style := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+				if m.cursor == len(active)+i {
+					style = style.Foreground(lipgloss.Color("86"))
+				}
+				mainPanel.WriteString(fmt.Sprintf("%s %s\n", cursor, style.Render(taskTitle)))
+			}
 		}
 	}
 
-	// Input field
-	if m.inputActive {
-		s += "\n" + m.input.View() + "\n"
-	} else {
-		s += "\n"
-		if len(m.currentPath) > 0 {
-			s += "Press 'n' to add a task, 'r' to rename, 'd' to delete, arrow keys to navigate, 'h' to go back, and 'esc' to exit.\n"
+	// Build details panel if there's space
+	var detailsPanel strings.Builder
+	if detailsPanelWidth > 0 {
+		detailsPanel.WriteString("Task Details\n\n")
+
+		// Get the currently selected task
+		var selectedTask *Task
+		active, completed := m.getCurrentTasks()
+		if m.cursor < len(active) && len(active) > 0 {
+			selectedTask = &active[m.cursor]
+		} else if len(completed) > 0 && m.cursor-len(active) < len(completed) {
+			selectedTask = &completed[m.cursor-len(active)]
+		}
+
+		if selectedTask != nil {
+			// Function to wrap text to fit panel width
+			wrapText := func(text string) string {
+				if text == "" {
+					return text
+				}
+				words := strings.Fields(text)
+				var lines []string
+				currentLine := words[0]
+				spaceLeft := detailsPanelWidth - 4 // Account for padding and borders
+				
+				for _, word := range words[1:] {
+					if len(currentLine)+1+len(word) <= spaceLeft {
+						currentLine += " " + word
+					} else {
+						lines = append(lines, currentLine)
+						currentLine = word
+					}
+				}
+				lines = append(lines, currentLine)
+				return strings.Join(lines, "\n")
+			}
+
+			// Show task details with text wrapping
+			detailsPanel.WriteString("Title: " + wrapText(selectedTask.Title) + "\n\n")
+
+			detailsPanel.WriteString("Description: \n")
+			if selectedTask.Description == "" {
+				detailsPanel.WriteString("(Press 'i' to add description)\n")
+			} else {
+				detailsPanel.WriteString(wrapText(selectedTask.Description) + "\n")
+			}
+			detailsPanel.WriteString("\n")
+
+			detailsPanel.WriteString("Notes: \n")
+			if selectedTask.Notes == "" {
+				detailsPanel.WriteString("(Press 'o' to add notes)\n")
+			} else {
+				detailsPanel.WriteString(wrapText(selectedTask.Notes) + "\n")
+			}
+			detailsPanel.WriteString("\n")
+
+			detailsPanel.WriteString("Created: " + selectedTask.CreatedAt.Format("2006-01-02 15:04") + "\n")
+			
+			detailsPanel.WriteString("Due Date: ")
+			if selectedTask.DueDate.IsZero() {
+				detailsPanel.WriteString("(Press 't' to set due date)\n")
+			} else {
+				detailsPanel.WriteString(selectedTask.DueDate.Format("2006-01-02 15:04") + "\n")
+			}
+
+			// Add keyboard shortcuts at the bottom if there's space
+			if m.height > 20 {
+				detailsPanel.WriteString("\n\nKeyboard Shortcuts:\n")
+				detailsPanel.WriteString("n: New task    d: Delete\n")
+				detailsPanel.WriteString("r: Rename      i: Edit description\n")
+				detailsPanel.WriteString("o: Edit notes  t: Set due date\n")
+				detailsPanel.WriteString("Enter: Toggle completion\n")
+				detailsPanel.WriteString("←/h: Back      →/l: Enter sublist\n")
+			}
 		} else {
-			s += "Press 'n' to add a task, 'r' to rename, 'd' to delete, arrow keys to navigate, and 'esc' to exit.\n"
+			detailsPanel.WriteString("No task selected")
 		}
 	}
 
-	return s
+	// Combine panels with border
+	mainPanelStr := lipgloss.NewStyle().
+		Width(mainPanelWidth).
+		Render(mainPanel.String())
+
+	if detailsPanelWidth > 0 {
+		detailsPanelStr := lipgloss.NewStyle().
+			Width(detailsPanelWidth).
+			Border(lipgloss.NormalBorder()).
+			BorderForeground(lipgloss.Color("12")).
+			Padding(1).
+			Render(detailsPanel.String())
+
+		s.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, mainPanelStr, "  ", detailsPanelStr))
+	} else {
+		s.WriteString(mainPanelStr)
+	}
+
+	return s.String()
+}
+
+// removeTask removes a task from a list of tasks
+func removeTask(tasks []Task, task Task) []Task {
+	for i, t := range tasks {
+		if t.ID == task.ID {
+			return append(tasks[:i], tasks[i+1:]...)
+		}
+	}
+	return tasks
+}
+
+// splitTasks splits tasks into active and completed tasks
+func splitTasks(tasks []Task) ([]Task, []Task) {
+	active := make([]Task, 0)
+	completed := make([]Task, 0)
+
+	for _, task := range tasks {
+		if task.Completed {
+			completed = append(completed, task)
+		} else {
+			active = append(active, task)
+		}
+	}
+
+	return active, completed
 }
 
 // generateID creates a unique ID for tasks
