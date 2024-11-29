@@ -140,6 +140,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							}
 						}
 					}
+					if err := SaveTasks(m.tasks); err != nil {
+						fmt.Printf("Error saving tasks: %v\n", err)
+					}
 				case "rename":
 					if len(m.currentPath) == 0 {
 						if m.cursor < len(active) {
@@ -153,6 +156,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						if m.cursor < len(parentTask.Tasks) {
 							parentTask.Tasks[m.cursor].Title = m.input.Value()
 						}
+					}
+					if err := SaveTasks(m.tasks); err != nil {
+						fmt.Printf("Error saving tasks: %v\n", err)
 					}
 				case "due_date":
 					dateStr := m.input.Value()
@@ -175,6 +181,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							if m.cursor < len(parentTask.Tasks) {
 								parentTask.Tasks[m.cursor].DueDate = dueDate
 							}
+						}
+						if err := SaveTasks(m.tasks); err != nil {
+							fmt.Printf("Error saving tasks: %v\n", err)
 						}
 					}
 				case "new_task":
@@ -207,6 +216,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.cursor = len(taskPtr.Tasks) - 1
 							m.currentPath[len(m.currentPath)-1] = *taskPtr
 						}
+					}
+					if err := SaveTasks(m.tasks); err != nil {
+						fmt.Printf("Error saving tasks: %v\n", err)
 					}
 				}
 				m.inputActive = false
@@ -267,6 +279,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.tasks = append(m.tasks, task)
 					m.completedTasks = removeTask(m.completedTasks, task)
 				}
+				if err := SaveTasks(m.tasks); err != nil {
+					fmt.Printf("Error saving tasks: %v\n", err)
+				}
 			} else {
 				// Find and update the actual task in the main task list
 				currentTask := &m.tasks
@@ -302,6 +317,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					
 					// Update current path with latest task data
 					m.currentPath[len(m.currentPath)-1] = *taskPtr
+					if err := SaveTasks(m.tasks); err != nil {
+						fmt.Printf("Error saving tasks: %v\n", err)
+					}
 				}
 			}
 
@@ -388,6 +406,90 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.Focus()
 			}
 
+		case "d":
+			active, completed := m.getCurrentTasks()
+			// Only allow deletion if there are tasks to delete
+			if len(active) == 0 && len(completed) == 0 {
+				return m, nil
+			}
+
+			if len(m.currentPath) == 0 {
+				// Delete from main task list
+				if m.cursor < len(active) {
+					// Delete active task
+					task := active[m.cursor]
+					m.tasks = removeTask(m.tasks, task)
+					if m.cursor >= len(active)-1 {
+						m.cursor = len(active) - 2
+						if m.cursor < 0 {
+							m.cursor = 0
+						}
+					}
+				} else if m.cursor < len(active)+len(completed) {
+					// Delete completed task
+					completedIdx := m.cursor - len(active)
+					task := completed[completedIdx]
+					m.completedTasks = removeTask(m.completedTasks, task)
+					if m.cursor >= len(active)+len(completed)-1 {
+						m.cursor = len(active) + len(completed) - 2
+						if m.cursor < 0 {
+							m.cursor = 0
+						}
+					}
+				} else {
+					// Cursor is out of bounds, don't delete anything
+					return m, nil
+				}
+			} else {
+				// Delete from subtask list
+				currentTask := &m.tasks
+				var taskPtr *Task
+				for i, pathTask := range m.currentPath {
+					for j := range *currentTask {
+						if (*currentTask)[j].ID == pathTask.ID {
+							if i == len(m.currentPath)-1 {
+								taskPtr = &(*currentTask)[j]
+							} else {
+								currentTask = &(*currentTask)[j].Tasks
+							}
+							break
+						}
+					}
+				}
+
+				if taskPtr != nil {
+					if m.cursor < len(active) {
+						// Delete active subtask
+						task := active[m.cursor]
+						taskPtr.Tasks = removeTask(taskPtr.Tasks, task)
+						if m.cursor >= len(active)-1 {
+							m.cursor = len(active) - 2
+							if m.cursor < 0 {
+								m.cursor = 0
+							}
+						}
+					} else {
+						// Delete completed subtask
+						completedIdx := m.cursor - len(active)
+						task := completed[completedIdx]
+						taskPtr.Tasks = removeTask(taskPtr.Tasks, task)
+						if m.cursor >= len(active)+len(completed)-1 {
+							m.cursor = len(active) + len(completed) - 2
+							if m.cursor < 0 {
+								m.cursor = 0
+							}
+						}
+					}
+					// Update current path with latest task data
+					m.currentPath[len(m.currentPath)-1] = *taskPtr
+				}
+			}
+			// Save tasks after deletion
+			if err := SaveTasks(m.tasks); err != nil {
+				fmt.Printf("Error saving tasks: %v\n", err)
+			}
+			return m, tea.ClearScreen
+
 		case "q":
 			return m, tea.Quit
 		}
@@ -428,6 +530,15 @@ func (m model) View() string {
 			path += " > " + task.Title
 		}
 		mainPanel.WriteString(path + "\n\n")
+	}
+
+	active, completed := m.getCurrentTasks()
+	if len(active) == 0 && len(completed) == 0 && !m.inputActive {
+		// Show hint message when no tasks exist
+		hint := lipgloss.NewStyle().
+			Foreground(lipgloss.Color("241")).
+			Render("No tasks yet! Press 'n' to create a new task")
+		mainPanel.WriteString("\n" + hint + "\n")
 	}
 
 	if m.inputActive {

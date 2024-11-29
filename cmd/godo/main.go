@@ -1,77 +1,57 @@
 package main
 
 import (
+	"fmt"
 	"github.com/wraient/godo/internal"
+	"os"
+	"path/filepath"
 	"time"
 )
 
 func main() {
-	now := time.Now()
-	
-	// Sample tasks with hierarchy and all fields
-	tasks := []internal.Task{
-		{
-			ID:          "1",
-			Title:       "Plan vacation",
-			Description: "Plan a week-long vacation to Japan",
-			Notes:       "Need to coordinate with family members",
-			Completed:   false,
-			CreatedAt:   now,
-			DueDate:     now.AddDate(0, 0, 14),
-			Tasks: []internal.Task{
-				{
-					ID:          "2",
-					Title:       "Book flight",
-					Description: "Find and book round-trip flights",
-					Notes:       "Check both direct and connecting flights",
-					Completed:   false,
-					CreatedAt:   now,
-					DueDate:     now.AddDate(0, 0, 3),
-					Tasks:       []internal.Task{},
-				},
-				{
-					ID:          "3",
-					Title:       "Reserve hotel",
-					Description: "Book hotels for each city",
-					Notes:       "Check reviews and locations",
-					Completed:   false,
-					CreatedAt:   now,
-					DueDate:     now.AddDate(0, 0, 5),
-					Tasks:       []internal.Task{},
-				},
+	// Load config
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		fmt.Printf("Error getting home directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	configPath := filepath.Join(homeDir, ".config", "godo", "godo.conf")
+	config, err := internal.LoadConfig(configPath)
+	if err != nil {
+		fmt.Printf("Error loading config: %v\n", err)
+		os.Exit(1)
+	}
+	internal.SetGlobalConfig(&config)
+
+	// Try to load existing tasks
+	tasks, err := internal.LoadTasks()
+	if err != nil {
+		fmt.Printf("Error loading tasks: %v\n", err)
+		os.Exit(1)
+	}
+
+	// If no tasks exist, create an intro task
+	if len(tasks) == 0 {
+		now := time.Now()
+		tasks = []internal.Task{
+			{
+				ID:          "1",
+				Title:       "Welcome to Godo!",
+				Description: "This is your task management app.",
+				Notes:       "",
+				Completed:   false,
+				CreatedAt:   now,
+				DueDate:     now.AddDate(0, 0, 1),
+				Tasks:       []internal.Task{},
 			},
-		},
-		{
-			ID:          "4",
-			Title:       "Work projects",
-			Description: "Current work assignments",
-			Notes:       "Track progress of all work items",
-			Completed:   false,
-			CreatedAt:   now,
-			DueDate:     now.AddDate(0, 0, 30),
-			Tasks: []internal.Task{
-				{
-					ID:          "5",
-					Title:       "Project presentation",
-					Description: "Prepare quarterly review presentation",
-					Notes:       "Include metrics and future plans",
-					Completed:   false,
-					CreatedAt:   now,
-					DueDate:     now.AddDate(0, 0, 7),
-					Tasks:       []internal.Task{},
-				},
-			},
-		},
-		{
-			ID:          "6",
-			Title:       "Shopping list",
-			Description: "Items to buy this week",
-			Notes:       "Check for deals and coupons",
-			Completed:   true,
-			CreatedAt:   now.AddDate(0, 0, -2),
-			DueDate:     now.AddDate(0, 0, 5),
-			Tasks:       []internal.Task{},
-		},
+		}
+
+		// Save the intro task
+		if err := internal.SaveTasks(tasks); err != nil {
+			fmt.Printf("Error saving tasks: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// Run the Bubble Tea Task UI
