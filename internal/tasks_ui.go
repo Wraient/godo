@@ -14,14 +14,29 @@ import (
 
 // Task represents a task or subtask
 type Task struct {
-	ID          string
-	Title       string
-	Description string
-	Notes       string
-	Completed   bool
-	CreatedAt   time.Time
-	DueDate     time.Time
-	Tasks       []Task
+	Id            string    `json:"id"`
+	Title         string    `json:"title"`
+	Description   string    `json:"description"`
+	Notes         string    `json:"notes"`
+	Status        string    `json:"status"`
+	Completed     bool      `json:"completed"`
+	CreatedAt     time.Time `json:"createdAt"`
+	DueDate       time.Time `json:"dueDate"`
+	CompletedDate time.Time `json:"completedDate"`
+	Parent        string    `json:"parent"`
+	Position      string    `json:"position"`
+	Kind          string    `json:"kind"`
+	SelfLink      string    `json:"selfLink"`
+	Etag          string    `json:"etag"`
+	Updated       time.Time `json:"updated"`
+	Created       time.Time `json:"created"`
+	Deleted       bool      `json:"deleted"`
+	Tasks         []Task    `json:"tasks"`
+	Links         []struct {
+		Type string `json:"type"`
+		Desc string `json:"description"`
+		Link string `json:"link"`
+	} `json:"links"`
 }
 
 // Model represents the state of our Bubble Tea program
@@ -37,26 +52,46 @@ type model struct {
 	editingField   string // Field currently being edited: "title", "description", "notes", "due_date"
 	width          int     // Terminal width
 	height         int     // Terminal height
+	updateChan     chan []Task
+	refreshChan    chan struct{} // Channel for UI refresh signals
+	googleTasks    *GoogleTasksClient // Add Google Tasks client
+	currentListID  string            // Current Google Tasks list ID
 }
 
 // NewModel initializes the Bubble Tea model with tasks
-func NewModel(tasks []Task) model {
+func NewModel(tasks []Task, client *GoogleTasksClient) model {
 	ti := textinput.New()
 	ti.Placeholder = "Enter task title..."
 	ti.Focus()
-	ti.CharLimit = 156
-	ti.Width = 50
 
-	// Get terminal dimensions
-	width, height, _ := term.GetSize(int(os.Stdout.Fd()))
-
-	return model{
-		tasks:       tasks,
-		input:       ti,
-		inputActive: false,
-		width:       width,
-		height:      height,
+	// Get the first task list ID
+	taskLists, err := client.service.Tasklists.List().Do()
+	var currentListID string
+	if err == nil && len(taskLists.Items) > 0 {
+		currentListID = taskLists.Items[0].Id
 	}
+
+	// Initialize channels
+	updateChan := make(chan []Task, 10)
+	refreshChan := make(chan struct{}, 1)
+
+	// Split initial tasks
+	active, completed := splitTasks(tasks)
+
+	m := model{
+		tasks:          active,
+		completedTasks: completed,
+		input:         ti,
+		updateChan:    updateChan,
+		refreshChan:   refreshChan,
+		googleTasks:   client,
+		currentListID: currentListID,
+	}
+
+	// Start update handler
+	go m.handleUpdates()
+
+	return m
 }
 
 // getCurrentTasks returns the current level's tasks based on currentPath
@@ -88,10 +123,30 @@ func (m *model) updateTerminalSize() {
 
 // Init starts the program
 func (m model) Init() tea.Cmd {
-	m.input = textinput.New()
-	m.input.Focus()
-	m.updateTerminalSize()  // Get initial terminal size
-	return nil
+	return m.waitForRefresh
+}
+
+// waitForRefresh waits for refresh signals
+func (m model) waitForRefresh() tea.Msg {
+	return <-m.refreshChan
+}
+
+// handleUpdates processes task updates in the background
+func (m *model) handleUpdates() {
+	for tasks := range m.updateChan {
+		m.tasks = tasks
+		active, completed := splitTasks(tasks)
+		m.tasks = active
+		m.completedTasks = completed
+		tea.Println("Tasks updated from Google")
+		
+		// Send refresh signal
+		select {
+		case m.refreshChan <- struct{}{}:
+		default:
+			// Channel is full, skip refresh
+		}
+	}
 }
 
 // Update handles keypresses and updates the state of the UI
@@ -100,8 +155,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
-		return m, tea.ClearScreen // Clear screen when window size changes
+		return m, nil
 
+	case struct{}: // Refresh message
+		return m, m.waitForRefresh
+	
 	case tea.KeyMsg:
 		// If input is active, handle all text input
 		if m.inputActive {
@@ -119,15 +177,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						if m.cursor < len(active) {
 							if m.inputAction == "description" {
 								active[m.cursor].Description = m.input.Value()
+								active[m.cursor].Updated = time.Now()
+								m.syncToGoogle(active[m.cursor])
 							} else {
 								active[m.cursor].Notes = m.input.Value()
+								active[m.cursor].Updated = time.Now()
+								m.syncToGoogle(active[m.cursor])
 							}
 						} else {
 							completedIdx := m.cursor - len(active)
 							if m.inputAction == "description" {
 								completed[completedIdx].Description = m.input.Value()
+								completed[completedIdx].Updated = time.Now()
+								m.syncToGoogle(completed[completedIdx])
 							} else {
 								completed[completedIdx].Notes = m.input.Value()
+								completed[completedIdx].Updated = time.Now()
+								m.syncToGoogle(completed[completedIdx])
 							}
 						}
 					} else {
@@ -135,8 +201,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						if m.cursor < len(parentTask.Tasks) {
 							if m.inputAction == "description" {
 								parentTask.Tasks[m.cursor].Description = m.input.Value()
+								parentTask.Tasks[m.cursor].Updated = time.Now()
+								m.syncToGoogle(parentTask.Tasks[m.cursor])
 							} else {
 								parentTask.Tasks[m.cursor].Notes = m.input.Value()
+								parentTask.Tasks[m.cursor].Updated = time.Now()
+								m.syncToGoogle(parentTask.Tasks[m.cursor])
 							}
 						}
 					}
@@ -147,14 +217,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					if len(m.currentPath) == 0 {
 						if m.cursor < len(active) {
 							active[m.cursor].Title = m.input.Value()
+							active[m.cursor].Updated = time.Now()
+							if active[m.cursor].Status == "" {
+								active[m.cursor].Status = "needsAction"
+							}
+							m.syncToGoogle(active[m.cursor])
 						} else {
 							completedIdx := m.cursor - len(active)
 							completed[completedIdx].Title = m.input.Value()
+							completed[completedIdx].Updated = time.Now()
+							if completed[completedIdx].Status == "" {
+								completed[completedIdx].Status = "completed"
+							}
+							m.syncToGoogle(completed[completedIdx])
 						}
 					} else {
 						parentTask := &m.currentPath[len(m.currentPath)-1]
 						if m.cursor < len(parentTask.Tasks) {
 							parentTask.Tasks[m.cursor].Title = m.input.Value()
+							parentTask.Tasks[m.cursor].Updated = time.Now()
+							if parentTask.Tasks[m.cursor].Status == "" {
+								parentTask.Tasks[m.cursor].Status = "needsAction"
+							}
+							m.syncToGoogle(parentTask.Tasks[m.cursor])
 						}
 					}
 					if err := SaveTasks(m.tasks); err != nil {
@@ -167,59 +252,221 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.input.Blur()
 						return m, nil
 					}
-					dueDate, err := time.Parse("2006-01-02 15:04", dateStr)
-					if err == nil {
-						if len(m.currentPath) == 0 {
-							if m.cursor < len(active) {
-								active[m.cursor].DueDate = dueDate
-							} else {
-								completedIdx := m.cursor - len(active)
-								completed[completedIdx].DueDate = dueDate
-							}
+
+					// Try parsing with different formats
+					var dueDate time.Time
+					var err error
+					formats := []string{
+						"2006-01-02 15:04",
+						"2006-01-02",
+						"01/02/2006",
+						"02-01-2006",
+					}
+
+					for _, format := range formats {
+						dueDate, err = time.Parse(format, dateStr)
+						if err == nil {
+							break
+						}
+					}
+
+					if err != nil {
+						tea.Printf("Invalid date format. Please use one of:\nYYYY-MM-DD HH:mm\nYYYY-MM-DD\nMM/DD/YYYY\nDD-MM-YYYY")
+						return m, nil
+					}
+
+					var task *Task
+					if len(m.currentPath) == 0 {
+						active, completed := m.getCurrentTasks()
+						if m.cursor < len(active) {
+							task = &active[m.cursor]
 						} else {
-							parentTask := &m.currentPath[len(m.currentPath)-1]
-							if m.cursor < len(parentTask.Tasks) {
-								parentTask.Tasks[m.cursor].DueDate = dueDate
+							completedIdx := m.cursor - len(active)
+							task = &completed[completedIdx]
+						}
+					} else {
+						parentTask := &m.currentPath[len(m.currentPath)-1]
+						if m.cursor < len(parentTask.Tasks) {
+							task = &parentTask.Tasks[m.cursor]
+						}
+					}
+
+					if task != nil {
+						task.DueDate = dueDate
+						task.Updated = time.Now()
+						if err := SaveTasks(m.tasks); err != nil {
+							fmt.Printf("Error saving tasks: %v\n", err)
+						}
+						m.syncToGoogle(*task)
+					}
+				case "new_task":
+					now := time.Now()
+					newTask := Task{
+						Title:     m.input.Value(),
+						CreatedAt: now,
+						Created:   now,
+						Updated:   now,
+						Status:    "needsAction",
+						Kind:      "tasks#task",
+						Notes:     "",
+					}
+
+					// Create task in Google Tasks first
+					listID := m.currentListID
+					if listID == "" {
+						// If currentListID is empty, try to get it again
+						taskLists, err := m.googleTasks.service.Tasklists.List().Do()
+						if err != nil {
+							fmt.Printf("Error getting task lists: %v\n", err)
+							return m, nil
+						}
+						if len(taskLists.Items) > 0 {
+							listID = taskLists.Items[0].Id
+							m.currentListID = listID
+						} else {
+							fmt.Printf("Error: No task lists found\n")
+							return m, nil
+						}
+					}
+
+					// Set parent ID if we're in a sublist
+					if len(m.currentPath) > 0 {
+						currentTask := m.currentPath[len(m.currentPath)-1]
+						// Only set parent if we're not at the root
+						if currentTask.Kind != "tasks#taskList" {
+							newTask.Parent = currentTask.Id
+						}
+					}
+
+					fmt.Printf("Debug: Creating task in list %s with parent %s\n", listID, newTask.Parent)
+					createdTask, err := m.googleTasks.CreateTask(newTask, listID)
+					if err != nil {
+						fmt.Printf("Error creating task in Google Tasks: %v\n", err)
+						return m, nil
+					}
+
+					// Just add the task to wherever we currently are
+					if len(m.currentPath) == 0 {
+						m.tasks = append(m.tasks, createdTask)
+						m.cursor = len(m.tasks) - 1
+					} else {
+						// Add to current view
+						parentTask := m.currentPath[len(m.currentPath)-1]
+						parentTask.Tasks = append(parentTask.Tasks, createdTask)
+						m.cursor = len(parentTask.Tasks) - 1
+						m.currentPath[len(m.currentPath)-1] = parentTask
+
+						// Also update the task in the main task tree
+						for i := range m.tasks {
+							if m.tasks[i].Id == parentTask.Id {
+								m.tasks[i] = parentTask
+								break
 							}
 						}
+					}
+
+					if err := SaveTasks(m.tasks); err != nil {
+						fmt.Printf("Error saving tasks: %v\n", err)
+					}
+
+					m.inputActive = false
+					m.input.Blur()
+					return m, nil
+				case "delete":
+					if m.input.Value() == "yes" {
+						active, completed := m.getCurrentTasks()
+						// Only allow deletion if there are tasks to delete
+						if len(active) == 0 && len(completed) == 0 {
+							return m, nil
+						}
+
+						if len(m.currentPath) == 0 {
+							// Delete from main task list
+							if m.cursor < len(active) {
+								// Delete active task
+								task := active[m.cursor]
+								task.Status = "deleted"
+								m.syncToGoogle(task)
+								m.tasks = removeTask(m.tasks, task)
+								if m.cursor >= len(active)-1 {
+									m.cursor = len(active) - 2
+									if m.cursor < 0 {
+										m.cursor = 0
+									}
+								}
+							} else if m.cursor < len(active)+len(completed) {
+								// Delete completed task
+								completedIdx := m.cursor - len(active)
+								task := completed[completedIdx]
+								task.Status = "deleted"
+								m.syncToGoogle(task)
+								m.completedTasks = removeTask(m.completedTasks, task)
+								if m.cursor >= len(active)+len(completed)-1 {
+									m.cursor = len(active) + len(completed) - 2
+									if m.cursor < 0 {
+										m.cursor = 0
+									}
+								}
+							} else {
+								// Cursor is out of bounds, don't delete anything
+								return m, nil
+							}
+						} else {
+							// Delete from subtask list
+							currentTask := &m.tasks
+							var taskPtr *Task
+							for i, pathTask := range m.currentPath {
+								for j := range *currentTask {
+									if (*currentTask)[j].Id == pathTask.Id {
+										if i == len(m.currentPath)-1 {
+											taskPtr = &(*currentTask)[j]
+										} else {
+											currentTask = &(*currentTask)[j].Tasks
+										}
+										break
+									}
+								}
+							}
+
+							if taskPtr != nil {
+								if m.cursor < len(active) {
+									// Delete active subtask
+									task := active[m.cursor]
+									task.Status = "deleted"
+									m.syncToGoogle(task)
+									taskPtr.Tasks = removeTask(taskPtr.Tasks, task)
+									if m.cursor >= len(active)-1 {
+										m.cursor = len(active) - 2
+										if m.cursor < 0 {
+											m.cursor = 0
+										}
+									}
+								} else {
+									// Delete completed subtask
+									completedIdx := m.cursor - len(active)
+									task := completed[completedIdx]
+									task.Status = "deleted"
+									m.syncToGoogle(task)
+									taskPtr.Tasks = removeTask(taskPtr.Tasks, task)
+									if m.cursor >= len(active)+len(completed)-1 {
+										m.cursor = len(active) + len(completed) - 2
+										if m.cursor < 0 {
+											m.cursor = 0
+										}
+									}
+								}
+								// Update the current path with the modified parent
+								m.currentPath[len(m.currentPath)-1] = *taskPtr
+							}
+						}
+						// Save tasks after deletion
 						if err := SaveTasks(m.tasks); err != nil {
 							fmt.Printf("Error saving tasks: %v\n", err)
 						}
 					}
-				case "new_task":
-					newTask := Task{
-						ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
-						Title:     m.input.Value(),
-						CreatedAt: time.Now(),
-					}
-					if len(m.currentPath) == 0 {
-						m.tasks = append(m.tasks, newTask)
-						m.cursor = len(active)
-					} else {
-						// Find the actual task in the main task list
-						currentTask := &m.tasks
-						var taskPtr *Task
-						for i, pathTask := range m.currentPath {
-							for j := range *currentTask {
-								if (*currentTask)[j].ID == pathTask.ID {
-									if i == len(m.currentPath)-1 {
-										taskPtr = &(*currentTask)[j]
-									} else {
-										currentTask = &(*currentTask)[j].Tasks
-									}
-									break
-								}
-							}
-						}
-						if taskPtr != nil {
-							taskPtr.Tasks = append(taskPtr.Tasks, newTask)
-							m.cursor = len(taskPtr.Tasks) - 1
-							m.currentPath[len(m.currentPath)-1] = *taskPtr
-						}
-					}
-					if err := SaveTasks(m.tasks); err != nil {
-						fmt.Printf("Error saving tasks: %v\n", err)
-					}
+					m.inputActive = false
+					m.input.Blur()
+					return m, nil
 				}
 				m.inputActive = false
 				m.input.Blur()
@@ -234,7 +481,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Handle navigation and shortcuts when input is not active
 		switch msg.String() {
 		case "down", "j":
-			m.updateTerminalSize()  // Update size on cursor movement
 			active, completed := m.getCurrentTasks()
 			if m.cursor < len(active)+len(completed)-1 {
 				m.cursor++
@@ -242,86 +488,40 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "up", "k":
-			m.updateTerminalSize()  // Update size on cursor movement
 			if m.cursor > 0 {
 				m.cursor--
 				return m, tea.ClearScreen
 			}
 
-		case "right", "l":
+		case "right", "l", "enter":
 			active, _ := m.getCurrentTasks()
 			if m.cursor < len(active) {
-				task := &active[m.cursor]
-				m.currentPath = append(m.currentPath, *task)
+				// Always allow entering a task to potentially create subtasks
+				if len(m.currentPath) == 0 {
+					// If entering a top-level task list, update the currentListID
+					m.currentListID = active[m.cursor].Id
+				}
+				m.currentPath = append(m.currentPath, active[m.cursor])
 				m.cursor = 0
 			}
+			return m, nil
 
 		case "left", "h":
 			if len(m.currentPath) > 0 {
-				m.cursor = 0
 				m.currentPath = m.currentPath[:len(m.currentPath)-1]
-			}
-
-		case "enter":
-			active, completed := m.getCurrentTasks()
-			if len(m.currentPath) == 0 {
-				if m.cursor < len(active) {
-					// Mark task as completed
-					task := active[m.cursor]
-					task.Completed = true
-					m.completedTasks = append(m.completedTasks, task)
-					m.tasks = removeTask(m.tasks, task)
+				m.cursor = 0
+				if len(m.currentPath) == 0 {
+					// If returning to top level, reset currentListID to first list
+					taskLists, err := m.googleTasks.service.Tasklists.List().Do()
+					if err == nil && len(taskLists.Items) > 0 {
+						m.currentListID = taskLists.Items[0].Id
+					}
 				} else {
-					// Move task back to active
-					completedIdx := m.cursor - len(active)
-					task := completed[completedIdx]
-					task.Completed = false
-					m.tasks = append(m.tasks, task)
-					m.completedTasks = removeTask(m.completedTasks, task)
-				}
-				if err := SaveTasks(m.tasks); err != nil {
-					fmt.Printf("Error saving tasks: %v\n", err)
-				}
-			} else {
-				// Find and update the actual task in the main task list
-				currentTask := &m.tasks
-				var taskPtr *Task
-				for i, pathTask := range m.currentPath {
-					for j := range *currentTask {
-						if (*currentTask)[j].ID == pathTask.ID {
-							if i == len(m.currentPath)-1 {
-								taskPtr = &(*currentTask)[j]
-							} else {
-								currentTask = &(*currentTask)[j].Tasks
-							}
-							break
-						}
-					}
-				}
-				
-				if taskPtr != nil {
-					if m.cursor < len(active) {
-						// Mark subtask as completed
-						task := active[m.cursor]
-						task.Completed = true
-						taskPtr.Tasks = removeTask(taskPtr.Tasks, task)
-						taskPtr.Tasks = append(taskPtr.Tasks, task)
-					} else {
-						// Move subtask back to active
-						completedIdx := m.cursor - len(active)
-						task := completed[completedIdx]
-						task.Completed = false
-						taskPtr.Tasks = removeTask(taskPtr.Tasks, task)
-						taskPtr.Tasks = append(taskPtr.Tasks, task)
-					}
-					
-					// Update current path with latest task data
-					m.currentPath[len(m.currentPath)-1] = *taskPtr
-					if err := SaveTasks(m.tasks); err != nil {
-						fmt.Printf("Error saving tasks: %v\n", err)
-					}
+					// If still in a nested list, update currentListID to parent list
+					m.currentListID = m.currentPath[0].Id // Always use the top-level list ID
 				}
 			}
+			return m, nil
 
 		case "n":
 			m.inputActive = true
@@ -383,25 +583,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "t":
 			active, completed := m.getCurrentTasks()
-			if (m.cursor < len(active) && len(active) > 0) || 
-			   (m.cursor >= len(active) && m.cursor-len(active) < len(completed)) {
+			var currentTask *Task
+			if m.cursor < len(active) {
+				currentTask = &active[m.cursor]
+			} else if m.cursor-len(active) < len(completed) {
+				currentTask = &completed[m.cursor-len(active)]
+			}
+
+			if currentTask != nil {
 				m.inputActive = true
 				m.inputAction = "due_date"
-				m.input.Placeholder = "YYYY-MM-DD HH:MM"
+				m.input.Placeholder = "Format: YYYY-MM-DD HH:mm, YYYY-MM-DD, MM/DD/YYYY, or DD-MM-YYYY"
 				
-				// Get the existing due date if any
-				var existingDate time.Time
-				if m.cursor < len(active) {
-					existingDate = active[m.cursor].DueDate
-				} else {
-					completedIdx := m.cursor - len(active)
-					existingDate = completed[completedIdx].DueDate
-				}
-				
-				if !existingDate.IsZero() {
-					m.input.SetValue(existingDate.Format("2006-01-02 15:04"))
+				// Show current due date if it exists
+				if !currentTask.DueDate.IsZero() {
+					m.input.SetValue(currentTask.DueDate.Format("2006-01-02 15:04"))
+					tea.Printf("Current due date: %s", currentTask.DueDate.Format("2006-01-02 15:04"))
 				} else {
 					m.input.SetValue("")
+					tea.Printf("No current due date. Enter in format: YYYY-MM-DD HH:mm, YYYY-MM-DD, MM/DD/YYYY, or DD-MM-YYYY")
 				}
 				m.input.Focus()
 			}
@@ -413,40 +613,45 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+			// Confirm deletion
+			m.inputActive = true
+			m.inputAction = "delete"
+			m.input.Placeholder = "Type 'yes' to confirm deletion"
+			m.input.SetValue("")
+			m.input.Focus()
+			return m, nil
+
+		case " ":
+			active, completed := m.getCurrentTasks()
 			if len(m.currentPath) == 0 {
-				// Delete from main task list
 				if m.cursor < len(active) {
-					// Delete active task
+					// Mark task as completed
 					task := active[m.cursor]
+					task.Completed = true
+					task.Status = "completed"
+					m.syncToGoogle(task)
+					m.completedTasks = append(m.completedTasks, task)
 					m.tasks = removeTask(m.tasks, task)
-					if m.cursor >= len(active)-1 {
-						m.cursor = len(active) - 2
-						if m.cursor < 0 {
-							m.cursor = 0
-						}
-					}
-				} else if m.cursor < len(active)+len(completed) {
-					// Delete completed task
+				} else {
+					// Move task back to active
 					completedIdx := m.cursor - len(active)
 					task := completed[completedIdx]
+					task.Completed = false
+					task.Status = "needsAction"
+					m.syncToGoogle(task)
+					m.tasks = append(m.tasks, task)
 					m.completedTasks = removeTask(m.completedTasks, task)
-					if m.cursor >= len(active)+len(completed)-1 {
-						m.cursor = len(active) + len(completed) - 2
-						if m.cursor < 0 {
-							m.cursor = 0
-						}
-					}
-				} else {
-					// Cursor is out of bounds, don't delete anything
-					return m, nil
+				}
+				if err := SaveTasks(m.tasks); err != nil {
+					fmt.Printf("Error saving tasks: %v\n", err)
 				}
 			} else {
-				// Delete from subtask list
+				// Find and update the actual task in the main task list
 				currentTask := &m.tasks
 				var taskPtr *Task
 				for i, pathTask := range m.currentPath {
 					for j := range *currentTask {
-						if (*currentTask)[j].ID == pathTask.ID {
+						if (*currentTask)[j].Id == pathTask.Id {
 							if i == len(m.currentPath)-1 {
 								taskPtr = &(*currentTask)[j]
 							} else {
@@ -456,39 +661,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 				}
-
+				
 				if taskPtr != nil {
 					if m.cursor < len(active) {
-						// Delete active subtask
+						// Mark subtask as completed
 						task := active[m.cursor]
+						task.Completed = true
+						task.Status = "completed"
+						m.syncToGoogle(task)
 						taskPtr.Tasks = removeTask(taskPtr.Tasks, task)
-						if m.cursor >= len(active)-1 {
-							m.cursor = len(active) - 2
-							if m.cursor < 0 {
-								m.cursor = 0
-							}
-						}
+						taskPtr.Tasks = append(taskPtr.Tasks, task)
 					} else {
-						// Delete completed subtask
+						// Move subtask back to active
 						completedIdx := m.cursor - len(active)
 						task := completed[completedIdx]
+						task.Completed = false
+						task.Status = "needsAction"
+						m.syncToGoogle(task)
 						taskPtr.Tasks = removeTask(taskPtr.Tasks, task)
-						if m.cursor >= len(active)+len(completed)-1 {
-							m.cursor = len(active) + len(completed) - 2
-							if m.cursor < 0 {
-								m.cursor = 0
-							}
-						}
+						taskPtr.Tasks = append(taskPtr.Tasks, task)
 					}
+					
 					// Update current path with latest task data
 					m.currentPath[len(m.currentPath)-1] = *taskPtr
+					if err := SaveTasks(m.tasks); err != nil {
+						fmt.Printf("Error saving tasks: %v\n", err)
+					}
 				}
 			}
-			// Save tasks after deletion
-			if err := SaveTasks(m.tasks); err != nil {
-				fmt.Printf("Error saving tasks: %v\n", err)
-			}
-			return m, tea.ClearScreen
+			return m, nil
 
 		case "q":
 			return m, tea.Quit
@@ -543,86 +744,94 @@ func (m model) View() string {
 
 	if m.inputActive {
 		if m.inputAction == "due_date" {
-			input := m.input.Value()
-			format := "YYYY-MM-DD HH:MM"
-			
-			// Get the existing due date if any
 			var oldDate string
-			active, completed := m.getCurrentTasks()
-			if m.cursor < len(active) && !active[m.cursor].DueDate.IsZero() {
+			if m.cursor >= 0 && m.cursor < len(active) {
 				oldDate = active[m.cursor].DueDate.Format("2006-01-02 15:04")
-			} else if m.cursor >= len(active) && m.cursor-len(active) < len(completed) {
-				completedIdx := m.cursor - len(active)
-				if !completed[completedIdx].DueDate.IsZero() {
-					oldDate = completed[completedIdx].DueDate.Format("2006-01-02 15:04")
-				}
 			}
-			
-			if len(input) > 0 {
-				// Replace the format characters with actual input where available
-				if len(input) >= 4 {
-					format = input[:4] + format[4:]
-				}
-				if len(input) >= 7 {
-					format = input[:7] + format[7:]
-				}
-				if len(input) >= 10 {
-					format = input[:10] + format[10:]
-				}
-				if len(input) >= 13 {
-					format = input[:13] + format[13:]
-				}
-				if len(input) >= 16 {
-					format = input
-				}
-			}
-			
 			if oldDate != "" {
 				mainPanel.WriteString("Current due date: " + oldDate + "\n")
 			}
-			mainPanel.WriteString("Enter due date > " + format + "\n" + m.input.View() + "\n\n")
+			mainPanel.WriteString("Enter due date (YYYY-MM-DD HH:mm, YYYY-MM-DD, MM/DD/YYYY, or DD-MM-YYYY): \n" + m.input.View() + "\n\n")
 		} else {
 			mainPanel.WriteString("Enter " + m.inputAction + ": " + m.input.View() + "\n\n")
 		}
 	} else {
-		// Get current level's tasks
-		active, completed := m.getCurrentTasks()
+		// Calculate available height for tasks
+		headerHeight := len(strings.Split(mainPanel.String(), "\n"))
+		footerHeight := 2 // For potential scroll indicators
+		availableHeight := m.height - headerHeight - footerHeight
+
+		// Calculate total tasks
+		totalTasks := len(active) + len(completed)
+
+		// Calculate visible window
+		startIdx := 0
+		if m.cursor >= availableHeight {
+			startIdx = m.cursor - (availableHeight / 2)
+		}
+		if startIdx < 0 {
+			startIdx = 0
+		}
+		endIdx := startIdx + availableHeight
+		if endIdx > totalTasks {
+			endIdx = totalTasks
+			// Adjust startIdx to show maximum possible tasks
+			if totalTasks > availableHeight {
+				startIdx = totalTasks - availableHeight
+			}
+		}
 
 		// Show active tasks
 		mainPanel.WriteString("Tasks:\n\n")
 		for i, task := range active {
-			cursor := " "
-			if m.cursor == i {
-				cursor = ">"
-			}
-			taskTitle := task.Title
-			if len(task.Tasks) > 0 {
-				taskTitle += " ▶"
-			}
-			if m.cursor == i {
-				taskTitle = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render(taskTitle)
-			}
-			mainPanel.WriteString(fmt.Sprintf("%s %s\n", cursor, taskTitle))
-		}
-
-		// Show completed tasks if any
-		if len(completed) > 0 {
-			mainPanel.WriteString("\nCompleted Tasks:\n\n")
-			for i, task := range completed {
+			if i >= startIdx && i < endIdx {
 				cursor := " "
-				if m.cursor == len(active)+i {
+				if m.cursor == i {
 					cursor = ">"
 				}
 				taskTitle := task.Title
 				if len(task.Tasks) > 0 {
 					taskTitle += " ▶"
 				}
-				style := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-				if m.cursor == len(active)+i {
-					style = style.Foreground(lipgloss.Color("86"))
+				if m.cursor == i {
+					taskTitle = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render(taskTitle)
 				}
-				mainPanel.WriteString(fmt.Sprintf("%s %s\n", cursor, style.Render(taskTitle)))
+				mainPanel.WriteString(fmt.Sprintf("%s %s\n", cursor, taskTitle))
 			}
+		}
+
+		// Show completed tasks if any
+		if len(completed) > 0 {
+			completedStartIdx := len(active)
+			if completedStartIdx >= startIdx && completedStartIdx < endIdx {
+				mainPanel.WriteString("\nCompleted Tasks:\n\n")
+			}
+			for i, task := range completed {
+				globalIdx := len(active) + i
+				if globalIdx >= startIdx && globalIdx < endIdx {
+					cursor := " "
+					if m.cursor == globalIdx {
+						cursor = ">"
+					}
+					taskTitle := task.Title
+					if len(task.Tasks) > 0 {
+						taskTitle += " ▶"
+					}
+					style := lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+					if m.cursor == globalIdx {
+						style = style.Foreground(lipgloss.Color("86"))
+					}
+					mainPanel.WriteString(fmt.Sprintf("%s %s\n", cursor, style.Render(taskTitle)))
+				}
+			}
+		}
+
+		// Add scroll indicators if needed
+		if startIdx > 0 {
+			mainPanel.WriteString("\n↑ More tasks above")
+		}
+		if endIdx < totalTasks {
+			mainPanel.WriteString("\n↓ More tasks below")
 		}
 	}
 
@@ -729,7 +938,7 @@ func (m model) View() string {
 // removeTask removes a task from a list of tasks
 func removeTask(tasks []Task, task Task) []Task {
 	for i, t := range tasks {
-		if t.ID == task.ID {
+		if t.Id == task.Id {
 			return append(tasks[:i], tasks[i+1:]...)
 		}
 	}
@@ -757,10 +966,65 @@ func generateID() string {
 	return fmt.Sprintf("%d", time.Now().UnixNano())
 }
 
+// UpdateTasks updates the task list and refreshes the UI
+func (m *model) UpdateTasks(tasks []Task) {
+	select {
+	case m.updateChan <- tasks:
+		// Task update sent successfully
+		if m.googleTasks != nil {
+			// Sync all tasks to Google
+			go func() {
+				err := ExportToGoogle(tasks)
+				if err != nil {
+					tea.Println("Error syncing with Google Tasks:", err)
+				}
+			}()
+		}
+	default:
+		fmt.Println("Warning: Update channel full, skipping update")
+	}
+}
+
+// syncToGoogle synchronizes local changes to Google Tasks
+func (m *model) syncToGoogle(task Task) {
+	if m.googleTasks == nil {
+		return
+	}
+
+	go func() {
+		var err error
+		switch task.Status {
+		case "needsAction":
+			if task.Id == "" {
+				// New task
+				_, err = m.googleTasks.CreateTask(task, m.currentListID)
+			} else {
+				// Updated task
+				err = m.googleTasks.UpdateTask(task)
+			}
+		case "completed":
+			err = m.googleTasks.UpdateTask(task)
+		case "deleted":
+			err = m.googleTasks.DeleteTask(task.Id)
+		}
+
+		if err != nil {
+			tea.Println("Error syncing with Google Tasks:", err)
+		}
+
+		// After individual task sync, sync all tasks to ensure consistency
+		if err := ExportToGoogle(m.tasks); err != nil {
+			tea.Println("Error syncing all tasks with Google:", err)
+		}
+	}()
+}
+
 // RunTaskUI starts the Bubble Tea program
-func RunTaskUI(tasks []Task) {
-	p := tea.NewProgram(NewModel(tasks))
+func RunTaskUI(tasks []Task, client *GoogleTasksClient) {
+	m := NewModel(tasks, client)
+	p := tea.NewProgram(m)
 	if err := p.Start(); err != nil {
-		fmt.Printf("Error: %v", err)
+		fmt.Printf("Error running program: %v\n", err)
+		os.Exit(1)
 	}
 }

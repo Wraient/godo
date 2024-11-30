@@ -1,34 +1,54 @@
 package main
 
 import (
+	"flag"
 	"fmt"
-	"github.com/wraient/godo/internal"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/wraient/godo/internal"
+
 )
 
 func main() {
-	// Load config
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		fmt.Printf("Error getting home directory: %v\n", err)
-		os.Exit(1)
-	}
+	// Parse command line flags
+	useGoogle := flag.Bool("google", false, "Use Google Tasks for storage")
+	flag.Parse()
 
-	configPath := filepath.Join(homeDir, ".config", "godo", "godo.conf")
-	config, err := internal.LoadConfig(configPath)
+	// Set the global flag for Google Tasks mode
+	internal.UseGoogleTasks = *useGoogle
+
+	var tasks []internal.Task
+	var err error
+
+	// Load configuration first, regardless of mode
+	config, err := internal.LoadConfig(filepath.Join(os.Getenv("HOME"), ".config", "godo", "config"))
 	if err != nil {
 		fmt.Printf("Error loading config: %v\n", err)
 		os.Exit(1)
 	}
 	internal.SetGlobalConfig(&config)
 
-	// Try to load existing tasks
-	tasks, err := internal.LoadTasks()
-	if err != nil {
-		fmt.Printf("Error loading tasks: %v\n", err)
-		os.Exit(1)
+	if internal.UseGoogleTasks {
+		err = internal.InitializeGoogleTasks()
+		if err != nil {
+			fmt.Printf("Error initializing Google Tasks: %v\n", err)
+			os.Exit(1)
+		}
+
+		tasks, err = internal.GoogleTasksClientVar.LoadTasks()
+		if err != nil {
+			fmt.Printf("Error loading tasks from Google: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		// Load tasks based on storage mode
+		tasks, err = internal.ImportTasks()
+		if err != nil {
+			fmt.Printf("Error loading tasks: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// If no tasks exist, create an intro task
@@ -36,24 +56,18 @@ func main() {
 		now := time.Now()
 		tasks = []internal.Task{
 			{
-				ID:          "1",
-				Title:       "Welcome to Godo!",
-				Description: "This is your task management app.",
-				Notes:       "",
-				Completed:   false,
-				CreatedAt:   now,
-				DueDate:     now.AddDate(0, 0, 1),
-				Tasks:       []internal.Task{},
+				Id:      "1",
+				Title:   "Welcome to Godo!",
+				Notes:   "This is your first task. Press 'n' to create a new task, 'e' to edit this task, or 'd' to delete it.",
+				Created: now,
+				Updated: now,
 			},
 		}
-
 		// Save the intro task
 		if err := internal.SaveTasks(tasks); err != nil {
-			fmt.Printf("Error saving tasks: %v\n", err)
-			os.Exit(1)
+			fmt.Printf("Error saving intro task: %v\n", err)
 		}
 	}
 
-	// Run the Bubble Tea Task UI
-	internal.RunTaskUI(tasks)
+	internal.RunTaskUI(tasks, internal.GoogleTasksClientVar)
 }

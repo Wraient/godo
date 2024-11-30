@@ -13,12 +13,18 @@ import (
 // GodoConfig struct with field names that match the config keys
 type GodoConfig struct {
 	StoragePath             string `config:"StoragePath"`
+	GoogleClientID          string `config:"GoogleClientID"`
+	GoogleClientSecret      string `config:"GoogleClientSecret"`
+	GoogleTokenPath         string `config:"GoogleTokenPath"`
 }
 
 // Default configuration values as a map
 func defaultConfigMap() map[string]string {
 	return map[string]string{
 		"StoragePath":             "$HOME/.local/share/godo",
+		"GoogleClientID":          "",
+		"GoogleClientSecret":      "",
+		"GoogleTokenPath":         "$HOME/.local/share/godo/google_token.json",
 	}
 }
 
@@ -45,31 +51,17 @@ func LoadConfig(configPath string) (GodoConfig, error) {
 		}
 	}
 
-	// Load the config from file
+	// Load config from file
 	configMap, err := loadConfigFromFile(configPath)
 	if err != nil {
 		return GodoConfig{}, fmt.Errorf("error loading config file: %v", err)
 	}
 
-	// Add missing fields to the config map
-	updated := false
-	defaultConfigMap := defaultConfigMap()
-	for key, defaultValue := range defaultConfigMap {
-		if _, exists := configMap[key]; !exists {
-			configMap[key] = defaultValue
-			updated = true
-		}
-	}
-
-	// Write updated config back to file if there were any missing fields
-	if updated {
-		if err := saveConfigToFile(configPath, configMap); err != nil {
-			return GodoConfig{}, fmt.Errorf("error saving updated config file: %v", err)
-		}
-	}
-
-	// Populate the CurdConfig struct from the config map
+	// Populate config struct
 	config := populateConfig(configMap)
+	
+	// Set the global config
+	SetGlobalConfig(&config)
 
 	return config, nil
 }
